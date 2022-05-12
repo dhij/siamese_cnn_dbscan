@@ -1,24 +1,25 @@
-import matplotlib.pyplot as plt
-import cv2
 import numpy as np
 import os
+import cv2
 import random
 import tensorflow as tf
 from pathlib import Path
-from tensorflow.keras import applications
-from tensorflow.keras import layers
-from tensorflow.keras import losses
-from tensorflow.keras import optimizers
-from tensorflow.keras import metrics
-from tensorflow.keras import Model
+from tensorflow import keras
+from tensorflow.keras import applications, losses, optimizers, metrics, Model
 from tensorflow.keras.layers import Layer, Input, Dense, Flatten, Lambda, Conv2D, MaxPooling2D
+from tensorflow.keras.applications import VGG16, vgg16
 from matplotlib import gridspec
 from matplotlib.image import imread
+import matplotlib.pyplot as plt
+import shutil
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import DBSCAN
+import seaborn as sns
 
 # Check availability of GPU
 import nvidia_smi
 
-GPU = 1
+GPU = 0
 os.environ["CUDA_VISIBLE_DEVICES"] = '{}'.format(GPU)
 
 gpus = tf.config.experimental.list_physical_devices('GPU')
@@ -44,29 +45,54 @@ if gpus:
 nvidia_smi.nvmlInit()
 handle = nvidia_smi.nvmlDeviceGetHandleByIndex(GPU)
 
+# Separate classes into train & test; executed only once
+
+
+def separate_dataset(data_src):
+    directories = os.listdir(data_src)
+    num_directory = len(directories)
+    train_test_ratio = 0.7
+    n_train = int(np.ceil(num_directory * train_test_ratio))
+
+    train_dirs = directories[0:n_train]
+    test_dirs = directories[n_train:]
+    if '-1' in train_dirs:
+        train_dirs.remove('-1')
+    if '-1' in test_dirs:
+        test_dirs.remove('-1')
+
+    for directory in os.listdir(data_src):
+        old_path = os.path.join(data_src, directory)
+
+        if directory in train_dirs:
+            train_path = os.path.join(data_src, 'train', directory)
+            shutil.copytree(old_path, train_path)
+        elif directory in test_dirs:
+            test_path = os.path.join(data_src, 'test', directory)
+            shutil.copytree(old_path, test_path)
+
+
+data_src = '/data/InJoon/1.5.dataset before augmentation and testing/malicious/1'
+# separate_dataset(data_src)
+
 
 class PreProcessing:
 
     images_train = np.array([])
-    images_test = np.array([])
     labels_train = np.array([])
-    labels_test = np.array([])
     unique_train_label = np.array([])
     map_train_label_indices = dict()
 
     def __init__(self, data_src):
         self.data_src = data_src
-        print("Loading Geological Similarity Dataset...")
-        self.images_train, self.images_test, self.labels_train, self.labels_test = self.preprocessing(
-            0.9)
+        print("Loading the Dataset...")
+        self.images_train, self.labels_train = self.preprocessing()
         self.unique_train_label = np.unique(self.labels_train)
         self.map_train_label_indices = {label: np.flatnonzero(self.labels_train == label) for label in
                                         self.unique_train_label}
         print('Preprocessing Done. Summary:')
         print("Images train :", self.images_train.shape)
         print("Labels train :", self.labels_train.shape)
-        print("Images test  :", self.images_test.shape)
-        print("Labels test  :", self.labels_test.shape)
         print("Unique label :", self.unique_train_label)
 
     def normalize(self, x):
@@ -76,40 +102,48 @@ class PreProcessing:
         return x
 
     def read_dataset(self):
-        X = []
-        y = []
+        count = 0
+        for directory in os.listdir(self.data_src):
+            count += len([file for file in os.listdir(os.path.join(self.data_src, directory))])
+
+        X = [None] * count
+        y = [None] * count
+        idx = 0
+
         for directory in os.listdir(self.data_src):
             try:
+                print('Read directory: ', directory)
                 for pic in os.listdir(os.path.join(self.data_src, directory)):
                     img = imread(os.path.join(self.data_src, directory, pic))
-                    X.append(np.squeeze(np.asarray(img)))
-                    y.append(directory)
+                    img = tf.image.resize(img, (224, 224))
+                    img = self.normalize(img)
+
+                    X[idx] = np.squeeze(np.asarray(img))
+                    y[idx] = directory
+                    idx += 1
+
             except Exception as e:
                 print('Failed to read images from Directory: ', directory)
                 print('Exception Message: ', e)
         print('Dataset loaded successfully.')
         return X, y
 
-    def preprocessing(self, train_test_ratio):
+    def preprocessing(self):
         X, y = self.read_dataset()
+
         labels = list(set(y))
         label_dict = dict(zip(labels, range(len(labels))))
         Y = np.asarray([label_dict[label] for label in y])
-        # normalize images
-        X = [self.normalize(x) for x in X]
 
         shuffle_indices = np.random.permutation(np.arange(len(y)))
         x_shuffled = []
         y_shuffled = []
+
         for index in shuffle_indices:
             x_shuffled.append(X[index])
             y_shuffled.append(Y[index])
 
-        size_of_dataset = len(x_shuffled)
-        n_train = int(np.ceil(size_of_dataset * train_test_ratio))
-        return np.asarray(x_shuffled[0:n_train]), np.asarray(x_shuffled[n_train + 1:size_of_dataset]), np.asarray(
-            y_shuffled[0:n_train]), np.asarray(y_shuffled[
-                                               n_train + 1:size_of_dataset])
+        return np.asarray(x_shuffled), np.asarray(y_shuffled)
 
     def get_triplets(self):
         label_l, label_r = np.random.choice(
@@ -144,7 +178,7 @@ class PreProcessing:
 class TripletLoss:
 
     def embedding(self):
-        inp = Input(shape=(28, 28, 3))
+        inp = Input(shape=(224, 224, 3))
 
         # first block
         c1 = Conv2D(32, (7, 7), activation='relu', padding='same',
@@ -175,7 +209,7 @@ class TripletLoss:
         return Model(inputs=[inp], outputs=[f1], name='embedding')
 
 
-class DistanceLayer(layers.Layer):
+class DistanceLayer(Layer):
     """
     This layer is responsible for computing the distance between the anchor
     embedding and the positive embedding, and the anchor embedding and the
@@ -193,7 +227,6 @@ class DistanceLayer(layers.Layer):
 
 class SiameseModel(Model):
     """The Siamese Network model with a custom training and testing loops.
-
     Computes the triplet loss using the three embeddings produced by the
     Siamese Network.
 
@@ -248,43 +281,8 @@ class SiameseModel(Model):
         # List metrics here so the `reset_states()` can be called automatically.
         return [self.loss_tracker]
 
-
-def visualize(anchor, positive, negative):
-    """Visualize a few triplets from the supplied batches."""
-
-    def show(ax, image):
-        ax.imshow(image)
-        ax.get_xaxis().set_visible(False)
-        ax.get_yaxis().set_visible(False)
-
-    fig = plt.figure(figsize=(9, 9))
-
-    axs = fig.subplots(3, 3)
-    for i in range(3):
-        show(axs[i, 0], anchor[i])
-        show(axs[i, 1], positive[i])
-        show(axs[i, 2], negative[i])
-
-
-dataset = PreProcessing('./sample2/data_repository/geological_similarity/')
-model = TripletLoss()
-target_shape = (28, 28)
-
-# Setup Network
-anchor_input = layers.Input(name="anchor", shape=target_shape + (3,))
-positive_input = layers.Input(name="positive", shape=target_shape + (3,))
-negative_input = layers.Input(name="negative", shape=target_shape + (3,))
-
-embedding = model.embedding()
-distances = DistanceLayer()(
-    embedding(anchor_input),
-    embedding(positive_input),
-    embedding(negative_input),
-)
-
-siamese_network = Model(
-    inputs=[anchor_input, positive_input, negative_input], outputs=distances
-)
+dataset = PreProcessing(
+    '/data/InJoon/1.5.dataset before augmentation and testing/malicious/1/train')
 data = dataset.get_triplets_batch()
 count = len(dataset.labels_train)
 
@@ -296,13 +294,30 @@ train_dataset = train_dataset.prefetch(8)
 val_dataset = val_dataset.batch(32, drop_remainder=False)
 val_dataset = val_dataset.prefetch(8)
 
-# Training
+model = TripletLoss()
+target_shape = (224, 224)
+
+# Setup Network
+anchor_input = Input(name="anchor", shape=target_shape + (3,))
+positive_input = Input(name="positive", shape=target_shape + (3,))
+negative_input = Input(name="negative", shape=target_shape + (3,))
+
+embedding = model.embedding()
+distances = DistanceLayer()(
+    embedding(anchor_input),
+    embedding(positive_input),
+    embedding(negative_input),
+)
+
+siamese_network = Model(
+    inputs=[anchor_input, positive_input, negative_input], outputs=distances
+)
+
 siamese_model = SiameseModel(siamese_network)
 siamese_model.compile(optimizer=optimizers.Adam(0.0001), metrics=['accuracy'])
-siamese_model.fit(train_dataset, epochs=40, validation_data=val_dataset)
+siamese_model.fit(train_dataset, epochs=20, validation_data=val_dataset)
 
-sample = next(iter(train_dataset))
-visualize(*sample)
+sample = train_dataset.as_numpy_iterator().next()
 
 anchor, positive, negative = sample
 anchor_embedding, positive_embedding, negative_embedding = (
@@ -311,76 +326,175 @@ anchor_embedding, positive_embedding, negative_embedding = (
     embedding(negative),
 )
 
-cosine_similarity = metrics.CosineSimilarity()
 
-positive_similarity = cosine_similarity(anchor_embedding, positive_embedding)
-negative_similarity = cosine_similarity(anchor_embedding, negative_embedding)
-print("Positive similarity:", positive_similarity.numpy())
-print("Negative similarity", negative_similarity.numpy())
-
-
-def find_k_nn(normalized_train_vectors, vec, k):
-    dist_arr = np.matmul(normalized_train_vectors, vec.T)
-    return np.argsort(-dist_arr.flatten())[:k]
+# Test Dataset
+def normalize(x):
+    min_val = np.min(x)
+    max_val = np.max(x)
+    x = (x - min_val) / (max_val - min_val)
+    return x
 
 
-def show_image(idxs, data):
-    if type(idxs) != np.ndarray:
-        idxs = np.array([idxs])
-    fig = plt.figure()
-    gs = gridspec.GridSpec(1, len(idxs))
-    for i in range(len(idxs)):
-        ax = fig.add_subplot(gs[0, i])
-        ax.imshow(data[idxs[i], :, :, :])
-        ax.axis('off')
-    plt.show()
+def read_dataset(data_src):
+    count = 0
+    for directory in os.listdir(data_src):
+        count += len([file for file in os.listdir(os.path.join(data_src, directory))])
 
+    X = [None] * count
+    y = [None] * count
+    idx = 0
 
-def get_train_test_dataset(train_test_ratio):
-    data_src = './sample2/data_repository/geological_similarity/'
-    X = []
-    y = []
     for directory in os.listdir(data_src):
         try:
+            print('Read directory: ', directory)
             for pic in os.listdir(os.path.join(data_src, directory)):
-                img = cv2.imread(os.path.join(data_src, directory, pic))
-                X.append(np.squeeze(np.asarray(img)))
-                y.append(directory)
-        except:
-            pass
+                img = imread(os.path.join(data_src, directory, pic))
+                img = tf.image.resize(img, (224, 224))
+                img = normalize(img)
+
+                X[idx] = np.squeeze(np.asarray(img))
+                y[idx] = directory
+                idx += 1
+
+        except Exception as e:
+            print('Failed to read images from Directory: ', directory)
+            print('Exception Message: ', e)
+    print('Dataset loaded successfully.')
+    return X, y
+
+
+test_data_src = '/data/InJoon/1.5.dataset before augmentation and testing/malicious/1/test'
+
+
+def preprocessing(test_data_src):
+    X, y = read_dataset(test_data_src)
 
     labels = list(set(y))
     label_dict = dict(zip(labels, range(len(labels))))
     Y = np.asarray([label_dict[label] for label in y])
+
     shuffle_indices = np.random.permutation(np.arange(len(y)))
     x_shuffled = []
     y_shuffled = []
+
     for index in shuffle_indices:
         x_shuffled.append(X[index])
         y_shuffled.append(Y[index])
 
-    size_of_dataset = len(x_shuffled)
-    n_train = int(np.ceil(size_of_dataset * train_test_ratio))
-    n_test = int(np.ceil(size_of_dataset * (1 - train_test_ratio)))
-    return np.asarray(x_shuffled[0:n_train]), np.asarray(x_shuffled[n_train + 1:size_of_dataset]), np.asarray(y_shuffled[0:n_train]), np.asarray(y_shuffled[
-        n_train + 1:size_of_dataset])
+    return np.asarray(x_shuffled), np.asarray(y_shuffled)
 
 
-# Prediction
-train_images, test_images, train_label, test_label = get_train_test_dataset(
-    0.7)
+test_images, test_labels = preprocessing(test_data_src)
+unique_test_labels = np.unique(test_labels)
+map_test_label_indices = {label: np.flatnonzero(
+    test_labels == label) for label in unique_test_labels}
 
-train_vectors = embedding.predict(train_images)
-normalized_train_vectors = train_vectors / \
-    np.linalg.norm(train_vectors, axis=1).reshape(-1, 1)
+# Define matrix
+matrix = [[0 for x in range(922)] for y in range(922)]
+rows, cols = len(matrix), len(matrix[0])
 
-idx = np.random.randint(0, len(test_images))
-im = test_images[idx]
-im = tf.expand_dims(im, axis=0)
-search_vector = embedding.predict([im])
-normalized_search_vec = search_vector/np.linalg.norm(search_vector)
+for r in range(rows):
+    for c in range(r+1, cols):
+        cosine_similarity = metrics.CosineSimilarity()
+        im1 = tf.expand_dims(test_images[r], axis=0)
+        im2 = tf.expand_dims(test_images[c], axis=0)
+        embedding1 = embedding(im1)
+        embedding2 = embedding(im2)
 
-k = 10
-candidate_index = find_k_nn(normalized_train_vectors, normalized_search_vec, k)
-show_image(idx, test_images)
-show_image(candidate_index, train_images)
+        similarity = cosine_similarity(embedding1, embedding2)
+
+        # compute distance matrix
+        matrix[r][c] = 1 - similarity.numpy()
+
+    if r % 10 == 0:
+        print("ROW:", r)
+
+# Copy upper triagnle of the matrix to the lower triangle
+matrix = np.triu(matrix)
+matrix = matrix + matrix.T - np.diag(np.diag(matrix))
+
+
+# Locate the optimal epsilon value where the curvature is maximum in the graph
+neigh = NearestNeighbors(n_neighbors=2)
+nbrs = neigh.fit(matrix)
+distances, indices = nbrs.kneighbors(matrix)
+
+distances = np.sort(distances, axis=0)
+distances = distances[:, 1]
+
+
+fig = plt.figure()
+ax = fig.gca()
+ax.set_yticks(np.arange(0, 4., 0.2))
+plt.grid()
+plt.rcParams['figure.figsize'] = [10, 8]
+plt.plot(distances)
+
+
+# DBSCAN
+distance_matrix = np.array(matrix)
+clustering = DBSCAN(eps=0.1, min_samples=10).fit(distance_matrix)
+cluster = clustering.labels_
+
+# sort cluster and keep track of label
+sorted_cluster_labels = [i[0] for i in sorted(
+    enumerate(cluster), key=lambda x:x[1], reverse=True)]
+
+# make a copy of test images and labels
+test_dataset = test_images.copy()
+test_labels_copy = test_labels.copy()
+
+# rearrange test images and labels based on the sorted cluster label
+test_dataset = np.array(test_dataset)
+test_dataset = test_dataset[sorted_cluster_labels]
+test_labels_copy = test_labels_copy[sorted_cluster_labels]
+
+# Rearrange rows and cols on the DBSCAN cluster labels
+distance_matrix = distance_matrix[:, sorted_cluster_labels]
+distance_matrix = distance_matrix[sorted_cluster_labels, :]
+
+# Plot the 2D heatmap
+ax = sns.heatmap(distance_matrix, linewidth=0.01)
+plt.show()
+
+# Visualize clusters
+sorted_cluster = sorted(cluster, reverse=True)
+cluster_unq_list = list(set(cluster))
+cluster_unq_list = sorted(cluster_unq_list, reverse=True)
+
+for i in range(len(cluster_unq_list)):
+    if i == len(cluster_unq_list)-1:
+        next_label_idx = 922
+    else:
+        next_label_idx = sorted_cluster.index(cluster_unq_list[i+1])
+    print(next_label_idx)
+
+
+def show(ax, image):
+    ax.imshow(image)
+    ax.get_xaxis().set_visible(False)
+    ax.get_yaxis().set_visible(False)
+
+
+fig_len = len(cluster_unq_list) * 5
+fig, axs = plt.subplots(len(cluster_unq_list), 5, figsize=(100, 100))
+
+start_idx = 0
+for i in range(len(cluster_unq_list)):
+    # index of the next label
+    if i == len(cluster_unq_list)-1:
+        next_label_idx = 922
+    else:
+        next_label_idx = sorted_cluster.index(cluster_unq_list[i+1])
+
+    # choose 5 indices randomly that belong to the same label
+    five_random_idx = np.random.choice(
+        list(range(start_idx, next_label_idx)), 5, replace=False)
+    start_idx = next_label_idx
+    print(five_random_idx)
+
+    show(axs[i, 0], test_images[five_random_idx[0]])
+    show(axs[i, 1], test_images[five_random_idx[1]])
+    show(axs[i, 2], test_images[five_random_idx[2]])
+    show(axs[i, 3], test_images[five_random_idx[3]])
+    show(axs[i, 4], test_images[five_random_idx[4]])
