@@ -15,6 +15,7 @@ import shutil
 from sklearn.neighbors import NearestNeighbors
 from sklearn.cluster import DBSCAN
 import seaborn as sns
+from tensorflow.keras.metrics import Recall
 
 # Check availability of GPU
 import nvidia_smi
@@ -281,6 +282,7 @@ class SiameseModel(Model):
         # List metrics here so the `reset_states()` can be called automatically.
         return [self.loss_tracker]
 
+
 dataset = PreProcessing(
     '/data/InJoon/1.5.dataset before augmentation and testing/malicious/1/train')
 data = dataset.get_triplets_batch()
@@ -498,3 +500,48 @@ for i in range(len(cluster_unq_list)):
     show(axs[i, 2], test_images[five_random_idx[2]])
     show(axs[i, 3], test_images[five_random_idx[3]])
     show(axs[i, 4], test_images[five_random_idx[4]])
+
+
+def generate_image_pairs(test_images):
+    image_pairs = []
+    labels = []
+
+    for _ in range(len(test_labels)):
+        # image pairs from the same cluster
+        random_label = np.random.choice(unique_test_labels)
+        a, p = np.random.choice(
+            map_test_label_indices[random_label], 2, replace=False)
+
+#        image_pairs.append((test_images[a], test_images[p]))
+        image_pairs.append((a, p))
+        labels.append(1)
+
+    for _ in range(len(test_labels)):
+        # image pairs from different clusters
+        label_l, label_r = np.random.choice(
+            unique_test_labels, 2, replace=False)
+        a = np.random.choice(map_test_label_indices[label_l])
+        n = np.random.choice(map_test_label_indices[label_r])
+
+#         image_pairs.append((test_images[a], test_images[n]))
+        image_pairs.append((a, n))
+        labels.append(0)
+
+    return image_pairs, labels
+
+
+val_image_pairs, val_labels = generate_image_pairs(test_images)
+
+predicted_labels = []
+
+for idx1, idx2 in val_image_pairs:
+    if cluster[idx1] == -1 and cluster[idx2] == -1:
+        predicted_labels.append(-1)
+    elif cluster[idx1] != cluster[idx2]:
+        predicted_labels.append(0)
+    else:
+        predicted_labels.append(1)
+
+m = Recall()
+m.update_state(val_labels, predicted_labels)
+m.result().numpy()
