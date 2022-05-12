@@ -227,7 +227,6 @@ class DistanceLayer(Layer):
 
 class SiameseModel(Model):
     """The Siamese Network model with a custom training and testing loops.
-
     Computes the triplet loss using the three embeddings produced by the
     Siamese Network.
 
@@ -281,7 +280,6 @@ class SiameseModel(Model):
     def metrics(self):
         # List metrics here so the `reset_states()` can be called automatically.
         return [self.loss_tracker]
-
 
 dataset = PreProcessing(
     '/data/InJoon/1.5.dataset before augmentation and testing/malicious/1/train')
